@@ -278,6 +278,15 @@ async function serve(request, response, {
       return;
     }
     const stream = createReadStream(filename);
+    const stopReadingOnDisconnect = () => {
+      if (!response.writableFinished && !stream.destroyed) {
+        stream.destroy();
+      }
+    };
+    response.once("close", stopReadingOnDisconnect);
+    stream.once("close", () => {
+      response.off("close", stopReadingOnDisconnect);
+    });
     stream.on("error", (error) => {
       logger.error("static_asset_stream_failed", {
         request_id: requestId,
