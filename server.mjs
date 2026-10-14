@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   CommunityImportError,
+  createCommunityFirmwareCache,
   fetchCommunityFirmware,
 } from "./community-import.mjs";
 import {
@@ -151,6 +152,7 @@ async function readJsonRequest(request) {
 
 async function serveCommunityFirmware(request, response, {
   communityFirmwareFetcher,
+  firmwareCache,
   logger,
   requestId,
 }) {
@@ -163,6 +165,7 @@ async function serveCommunityFirmware(request, response, {
   try {
     const payload = await readJsonRequest(request);
     const firmware = await communityFirmwareFetcher(payload?.url, undefined, {
+      cache: firmwareCache,
       onRetry: ({ attempt, delayMs, error }) => {
         logger.warn("community_firmware_retry", {
           request_id: requestId,
@@ -213,6 +216,7 @@ async function serveCommunityFirmware(request, response, {
 
 async function serve(request, response, {
   communityFirmwareFetcher,
+  firmwareCache,
   logger,
   requestId,
   runtimeConfig,
@@ -322,10 +326,12 @@ export function createAppServer(options = {}) {
   });
   const communityFirmwareFetcher =
     options.communityFirmwareFetcher ?? fetchCommunityFirmware;
+  const firmwareCache = options.firmwareCache ?? createCommunityFirmwareCache();
   const server = http.createServer((request, response) => {
     const requestId = startAccessLog(request, response, logger);
     serve(request, response, {
       communityFirmwareFetcher,
+      firmwareCache,
       logger,
       requestId,
       runtimeConfig,

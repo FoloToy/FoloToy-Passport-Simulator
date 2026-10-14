@@ -10,6 +10,15 @@ export { COMMUNITY_ORIGIN };
 
 export const COMMUNITY_DOWNLOAD_RETRIES = 3;
 const COMMUNITY_RETRY_BASE_DELAY_MS = 250;
+const COMMUNITY_CACHE_TTL_MS = 10 * 60 * 1000;
+const COMMUNITY_CACHE_MAX_ENTRIES = 4;
+
+export function createCommunityFirmwareCache({
+  ttlMs = COMMUNITY_CACHE_TTL_MS,
+  maxEntries = COMMUNITY_CACHE_MAX_ENTRIES,
+} = {}) {
+  return { entries: new Map(), inFlight: new Map(), ttlMs, maxEntries };
+}
 
 export class CommunityImportError extends Error {
   constructor(message, status = 400, { retryable = false, details } = {}) {
@@ -40,7 +49,10 @@ async function retryCommunityOperation(operation, retryDelay, onRetry) {
       const retryable =
         !(error instanceof CommunityImportError) || error.retryable;
       if (!retryable || retryCount >= COMMUNITY_DOWNLOAD_RETRIES) throw error;
-      const delayMs = COMMUNITY_RETRY_BASE_DELAY_MS * (2 ** retryCount);
+      const retryAfter = Number(error?.details?.retry_after);
+      const delayMs = Number.isFinite(retryAfter) && retryAfter >= 0
+        ? Math.min(30_000, retryAfter * 1000)
+        : COMMUNITY_RETRY_BASE_DELAY_MS * (2 ** retryCount);
       try {
         onRetry({
           attempt: retryCount + 1,
@@ -177,6 +189,7 @@ export async function fetchCommunityFirmware(
   {
     onRetry = () => {},
     retryDelay = waitForRetry,
+    cache,
   } = {},
 ) {
   const reference = parseCommunityPlayUrl(value);
@@ -233,7 +246,15 @@ export async function fetchCommunityFirmware(
     throw new CommunityImportError("社区固件下载地址无效", 422);
   }
 
-  const { bytes, sha256 } = await retryCommunityOperation(async () => {
+  const cacheKey = firmware.sha256.toLowerCase();
+  const cached = cache?.entries?.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    const title = String(play.title?.zh || play.title?.en || play.slug || "社区固件");
+    return { ...cached, slug: String(play.slug || reference.value), title };
+  }
+  if (cached) cache.entries.delete(cacheKey);
+
+  const download = async () => retryCommunityOperation(async () => {
     const firmwareResponse = await fetchImpl(downloadUrl, {
       headers: { accept: "application/octet-stream" },
       redirect: "error",
@@ -287,6 +308,30 @@ export async function fetchCommunityFirmware(
     }
     return { bytes: downloadedBytes, sha256: downloadedSha256 };
   }, retryDelay, onRetry);
+  let downloadPromise = cache?.inFlight?.get(cacheKey);
+  if (!downloadPromise) {
+    downloadPromise = download();
+    cache?.inFlight?.set(cacheKey, downloadPromise);
+  }
+  let result;
+  try {
+    result = await downloadPromise;
+  } finally {
+    if (cache?.inFlight?.get(cacheKey) === downloadPromise) {
+      cache.inFlight.delete(cacheKey);
+    }
+  }
+  const { bytes, sha256 } = result;
+  if (cache) {
+    cache.entries.set(cacheKey, {
+      bytes,
+      sha256,
+      expiresAt: Date.now() + cache.ttlMs,
+    });
+    while (cache.entries.size > cache.maxEntries) {
+      cache.entries.delete(cache.entries.keys().next().value);
+    }
+  }
 
   const title = String(play.title?.zh || play.title?.en || play.slug || "社区固件");
   return {
