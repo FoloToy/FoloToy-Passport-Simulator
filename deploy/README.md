@@ -1,7 +1,7 @@
 # apsimulator.folotoy.cn production deployment
 
 Deployed 2026-09-25 to `root@39.107.90.51` (Debian 12).
-Application source revision: `91b0914`. Previous release: `68153f1`.
+Application source revision: `d82ad45`. Previous release: `91b0914-community-cache`.
 
 ## Architecture
 
@@ -22,7 +22,7 @@ Application source revision: `91b0914`. Previous release: `68153f1`.
 
 The service has read-only filesystem protection, no Linux capabilities,
 automatic restart, a 768 MiB memory limit, and a two-CPU quota. Local firmware
-upload and private network destinations are disabled. Nginx limits community
+selection is enabled; private network destinations are disabled. Nginx limits community
 import request rates and WebSocket connections per IP. The application has an
 existing global limit of 16 simultaneous network bridge sessions.
 

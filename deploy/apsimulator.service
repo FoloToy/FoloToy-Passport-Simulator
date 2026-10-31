@@ -12,7 +12,7 @@ Group=apsimulator
 WorkingDirectory=/opt/apsimulator/current
 ExecStart=/opt/apsimulator/runtime/node-v22.23.3-linux-x64/bin/node server.mjs
 Environment=NODE_ENV=production HOST=127.0.0.1 PORT=4190
-Environment=EMULATOR_ALLOW_LOCAL_FIRMWARE_UPLOAD=0 EMULATOR_NETWORK_ALLOW_PRIVATE=0
+Environment=EMULATOR_ALLOW_LOCAL_FIRMWARE_UPLOAD=1 EMULATOR_NETWORK_ALLOW_PRIVATE=0
 Restart=always
 RestartSec=5
 TimeoutStopSec=20
