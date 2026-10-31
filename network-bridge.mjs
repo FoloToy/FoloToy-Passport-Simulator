@@ -33,6 +33,8 @@ const TCP_RST = 0x04;
 const TCP_PSH = 0x08;
 const TCP_ACK = 0x10;
 const TCP_MSS = 1300;
+// Keep several segments in flight so lwIP's delayed ACK does not throttle streams.
+const TCP_SEND_WINDOW = 8 * TCP_MSS;
 const MAX_TCP_CONNECTIONS = 64;
 const MAX_TCP_QUEUED_BYTES = 1024 * 1024;
 const TCP_PAUSE_BYTES = 64 * 1024;
@@ -111,7 +113,8 @@ class TcpFlow {
     this.state = "connecting";
     this.queue = [];
     this.queuedBytes = 0;
-    this.inFlight = null;
+    this.inFlight = [];
+    this.hostAcknowledged = this.hostInitial;
     this.remoteEnded = false;
     this.guestEnded = false;
     this.closed = false;
@@ -142,13 +145,12 @@ class TcpFlow {
 
   handle(tcp) {
     this.lastActivity = Date.now();
-    this.remoteWindow = tcp.window;
     if (tcp.flags & TCP_RST) {
       this.close();
       return;
     }
 
-    if (tcp.flags & TCP_ACK) this.#handleAcknowledgment(tcp.acknowledgment);
+    if (tcp.flags & TCP_ACK) this.#handleAcknowledgment(tcp.acknowledgment, tcp.window);
     if (this.closed) return;
 
     if (tcp.payload.byteLength) {
@@ -167,7 +169,7 @@ class TcpFlow {
       this.guestEnded = true;
       this.#sendSegment(TCP_ACK);
       this.socket.end();
-      if (this.remoteEnded && !this.inFlight) this.close(false);
+      if (this.remoteEnded && this.state === "fin-acked") this.close(false);
     }
     this.#pump();
   }
@@ -186,19 +188,45 @@ class TcpFlow {
     this.hostNext = end;
   }
 
-  #handleAcknowledgment(acknowledgment) {
-    if (!this.inFlight || !sequenceAtOrAfter(acknowledgment, this.inFlight.end)) {
+  #handleAcknowledgment(acknowledgment, window) {
+    // Ignore stale/impossible ACKs, including across sequence-number wraparound.
+    if (!sequenceAtOrAfter(acknowledgment, this.hostAcknowledged) ||
+        !sequenceAtOrAfter(this.hostNext, acknowledgment)) {
       return;
     }
-    clearTimeout(this.inFlight.timer);
-    const kind = this.inFlight.kind;
-    this.inFlight = null;
-    if (kind === "syn") this.state = "established";
-    if (kind === "fin") {
-      this.close(false);
-      return;
+    this.hostAcknowledged = acknowledgment;
+    this.remoteWindow = window;
+    while (this.inFlight.length &&
+           sequenceAtOrAfter(acknowledgment, this.inFlight[0].end)) {
+      const tracked = this.inFlight.shift();
+      this.session.clearTimeout(tracked.timer);
+      if (tracked.kind === "syn") this.state = "established";
+      if (tracked.kind === "fin") {
+        this.state = "fin-acked";
+        if (this.guestEnded) this.close(false);
+        else {
+          this.finTimer = this.session.setTimeout(() => this.close(false), 30_000);
+          this.finTimer.unref?.();
+        }
+      }
     }
-    this.#pump();
+    const oldest = this.inFlight[0];
+    if (oldest?.kind === "data" &&
+        sequenceAtOrAfter(acknowledgment, oldest.start) &&
+        !sequenceAtOrAfter(acknowledgment, oldest.end)) {
+      const acknowledgedBytes = (acknowledgment - oldest.start) >>> 0;
+      if (acknowledgedBytes > 0 && acknowledgedBytes <= oldest.payload.byteLength) {
+        oldest.start = acknowledgment;
+        oldest.payload = oldest.payload.slice(acknowledgedBytes);
+        oldest.frame = this.#createSegment(
+          oldest.flags,
+          oldest.payload,
+          oldest.options,
+          oldest.start,
+        );
+        this.#scheduleRetry(oldest, true);
+      }
+    }
   }
 
   #receiveRemote(data) {
@@ -228,14 +256,15 @@ class TcpFlow {
     if (
       this.closed ||
       this.state !== "established" ||
-      this.inFlight ||
       this.remoteWindow === 0
     ) {
       return;
     }
-    const queued = this.queue[0];
-    if (queued) {
-      const length = Math.min(queued.byteLength, TCP_MSS, this.remoteWindow);
+    let available = Math.min(this.remoteWindow, TCP_SEND_WINDOW) -
+      ((this.hostNext - this.hostAcknowledged) >>> 0);
+    while (this.queue.length && available > 0) {
+      const queued = this.queue[0];
+      const length = Math.min(queued.byteLength, TCP_MSS, available);
       const payload = queued.slice(0, length);
       if (length === queued.byteLength) this.queue.shift();
       else this.queue[0] = queued.slice(length);
@@ -244,29 +273,35 @@ class TcpFlow {
       const end = (this.hostNext + payload.byteLength) >>> 0;
       this.#sendTracked(TCP_PSH | TCP_ACK, payload, end, "data");
       this.hostNext = end;
-      return;
+      available -= length;
     }
-    if (this.remoteEnded) {
+    if (this.remoteEnded && !this.queue.length && !this.inFlight.length && available > 0) {
       const end = (this.hostNext + 1) >>> 0;
       this.#sendTracked(TCP_FIN | TCP_ACK, new Uint8Array(), end, "fin");
       this.hostNext = end;
+      this.state = "fin-sent";
     }
   }
 
-  #sendSegment(flags, payload = new Uint8Array(), options = new Uint8Array()) {
+  #createSegment(
+    flags,
+    payload = new Uint8Array(),
+    options = new Uint8Array(),
+    sequence = this.hostNext,
+  ) {
     const tcp = buildTcpPacket({
       sourceIp: this.remoteIp,
       destinationIp: this.guestIp,
       sourcePort: this.remotePort,
       destinationPort: this.guestPort,
-      sequence: this.hostNext,
+      sequence,
       acknowledgment: this.guestNext,
       flags,
       window: 65535,
       payload,
       options,
     });
-    return this.session.sendIpv4({
+    return this.session.createIpv4({
       destinationMac: this.guestMac,
       sourceIp: this.remoteIp,
       destinationIp: this.guestIp,
@@ -275,23 +310,49 @@ class TcpFlow {
     });
   }
 
+  #sendSegment(flags, payload = new Uint8Array(), options = new Uint8Array()) {
+    const frame = this.#createSegment(flags, payload, options);
+    this.session.sendFrame(frame);
+    return frame;
+  }
+
   #sendTracked(flags, payload, end, kind, options = new Uint8Array()) {
-    const frame = this.#sendSegment(flags, payload, options);
-    const tracked = { frame, end, kind, attempts: 0, timer: null };
-    const retry = () => {
-      if (this.closed || this.inFlight !== tracked) return;
+    const start = this.hostNext;
+    const tracked = {
+      frame: this.#sendSegment(flags, payload, options),
+      start,
+      end,
+      flags,
+      payload,
+      options,
+      kind,
+      attempts: 0,
+      timer: null,
+      retry: null,
+    };
+    tracked.retry = () => {
+      if (this.closed || !this.inFlight.includes(tracked)) return;
       if (tracked.attempts >= MAX_RETRANSMITS) {
         this.#fail("guest acknowledgment timeout");
         return;
       }
       tracked.attempts += 1;
-      this.session.sendFrame(frame);
-      tracked.timer = setTimeout(retry, RETRANSMIT_MS * tracked.attempts);
+      this.session.sendFrame(tracked.frame);
+      tracked.timer = this.session.setTimeout(
+        tracked.retry,
+        RETRANSMIT_MS * tracked.attempts,
+      );
       tracked.timer.unref?.();
     };
-    tracked.timer = setTimeout(retry, RETRANSMIT_MS);
+    this.inFlight.push(tracked);
+    this.#scheduleRetry(tracked);
+  }
+
+  #scheduleRetry(tracked, resetAttempts = false) {
+    this.session.clearTimeout(tracked.timer);
+    if (resetAttempts) tracked.attempts = 0;
+    tracked.timer = this.session.setTimeout(tracked.retry, RETRANSMIT_MS);
     tracked.timer.unref?.();
-    this.inFlight = tracked;
   }
 
   #fail(reason) {
@@ -309,7 +370,9 @@ class TcpFlow {
   close(destroySocket = true) {
     if (this.closed) return;
     this.closed = true;
-    clearTimeout(this.inFlight?.timer);
+    this.session.clearTimeout(this.finTimer);
+    for (const tracked of this.inFlight) this.session.clearTimeout(tracked.timer);
+    this.inFlight = [];
     if (destroySocket) this.socket.destroy?.();
     this.session.deleteTcpFlow(this);
     this.session.emitEvent({
@@ -351,6 +414,8 @@ export class EthernetNatSession {
     this.dnsServer = options.dnsServer ?? selectDnsServer();
     this.randomUint32 = options.randomUint32 ??
       (() => randomBytes(4).readUInt32BE(0));
+    this.setTimeout = options.setTimeoutFn ?? setTimeout;
+    this.clearTimeout = options.clearTimeoutFn ?? clearTimeout;
     this.tcpFlows = new Map();
     this.udpFlows = new Map();
     this.identification = 1;
@@ -382,11 +447,16 @@ export class EthernetNatSession {
   }
 
   sendIpv4(packet) {
+    const frame = this.createIpv4(packet);
+    this.sendFrame(frame);
+    return frame;
+  }
+
+  createIpv4(packet) {
     const frame = buildIpv4Frame({
       ...packet,
       identification: this.identification++,
     });
-    this.sendFrame(frame);
     return frame;
   }
 

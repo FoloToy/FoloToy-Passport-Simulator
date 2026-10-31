@@ -1,3 +1,5 @@
+import { supportsVirtualProvisioning, provisionXiaozhi } from "./provisioning.js";
+import { FirmwareOperationGate } from "./firmware-operation.js";
 import { QemuRuntime } from "./runtime.js";
 import { BrowserAudio } from "./audio.js";
 import {
@@ -15,15 +17,18 @@ import {
   formatHex32,
 } from "./inspector.js";
 import { copyCanvasPngToClipboard } from "./screen-capture.js";
+import {
+  recordingFilename,
+  startScreenRecording,
+  supportsScreenRecording,
+} from "./screen-recording.js";
 import { showSimulatorNoticeOnce } from "./simulator-notice.js";
 import { loadAnalytics } from "./analytics.js";
 
-const DOUBLE_CLICK_WINDOW_MS = 300;
-const LONG_PRESS_MS = 300;
 
 
 const runtime = new QemuRuntime();
-const audio = new BrowserAudio((bytes) => runtime.sendMicrophone(bytes));
+const audio = new BrowserAudio((samples, sampleRate) => runtime.sendMicrophone(samples, sampleRate));
 const display = document.querySelector("#qemu-display");
 const context = display.getContext("2d", { alpha: false });
 const overlay = document.querySelector("#screen-overlay");
@@ -59,6 +64,12 @@ const presetFeedback = document.querySelector("#preset-feedback");
 const inspectorToggle = document.querySelector("#inspector-toggle");
 const screenshotCopy = document.querySelector("#screenshot-copy");
 const screenshotFeedback = document.querySelector("#screenshot-feedback");
+const recordingToggle = document.querySelector("#recording-toggle");
+const recordingLabel = document.querySelector("#recording-label");
+const recordingTime = document.querySelector("#recording-time");
+const recordingFeedback = document.querySelector("#recording-feedback");
+const recordingMessage = document.querySelector("#recording-message");
+const recordingDownload = document.querySelector("#recording-download");
 const fullscreenToggle = document.querySelector("#fullscreen-toggle");
 const simulatorStage = document.querySelector("#simulator-stage");
 const audioEnable = document.querySelector("#audio-enable");
@@ -102,10 +113,15 @@ let uartRenderPending = false;
 let allowLocalFirmwareUpload = false;
 let fullscreenFallback = false;
 let screenshotFeedbackTimer = 0;
+let screenRecording = null;
+let recordingTimer = 0;
+let recordingStartedAt = 0;
+let recordingUrl = null;
+let recordingStopping = false;
+const recordingSupported = supportsScreenRecording(display);
 const heldPointerButtons = new Set();
 const heldKeyboardButtons = new Set();
 const activeButtonGestures = new Map();
-const pendingButtonClicks = new Map();
 
 function log(message) {
   const item = document.createElement("li");
@@ -220,6 +236,8 @@ function setUartPaused(paused) {
 
 function setRuntimeState(state, detail) {
   currentRuntimeState = state;
+  syncVirtualWifiControl();
+  syncRecordingControl();
   runtimeState.textContent = detail || state;
   runtimeState.title = detail || state;
   runtimeLight.dataset.state = state;
@@ -387,6 +405,7 @@ function syncNetworkDebugState() {
     activeDebugTab === "network" &&
     inspectorPanel.classList.contains("is-open");
   runtime.setNetworkDebug(enabled);
+  runtime.setCpuDebug(activeDebugTab === "cpu" && inspectorPanel.classList.contains("is-open"));
 }
 
 function selectDebugTab(tab) {
@@ -522,82 +541,103 @@ async function copySimulatorScreen() {
   }
 }
 
+function syncRecordingControl() {
+  const active = Boolean(screenRecording);
+  recordingToggle.disabled = !recordingSupported || recordingStopping ||
+    (!active && currentRuntimeState !== "running");
+  recordingToggle.setAttribute("aria-pressed", String(active));
+  recordingToggle.setAttribute("aria-busy", String(recordingStopping));
+  const label = !recordingSupported ? "当前浏览器不支持屏幕录制" :
+    recordingStopping ? "正在生成录屏视频" :
+    active ? "停止录屏并下载视频" : "开始录制 AI Passport 屏幕";
+  recordingToggle.setAttribute("aria-label", label);
+  recordingToggle.title = label;
+  recordingLabel.textContent = recordingStopping ? "保存中" : active ? "停止" : "录屏";
+  recordingTime.hidden = !active;
+}
+
+function updateRecordingTime() {
+  const seconds = Math.floor((performance.now() - recordingStartedAt) / 1000);
+  recordingTime.textContent =
+    `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function showRecordingFeedback(state, message) {
+  recordingFeedback.dataset.state = state;
+  recordingMessage.textContent = message;
+  recordingFeedback.hidden = false;
+}
+
+async function toggleScreenRecording() {
+  if (screenRecording) {
+    if (recordingStopping) return;
+    recordingStopping = true;
+    window.clearInterval(recordingTimer);
+    syncRecordingControl();
+    showRecordingFeedback("saving", "正在生成录屏视频…");
+    screenRecording.stop();
+    return;
+  }
+
+  recordingDownload.hidden = true;
+  try {
+    screenRecording = startScreenRecording(display);
+    recordingStartedAt = performance.now();
+    updateRecordingTime();
+    recordingTimer = window.setInterval(updateRecordingTime, 250);
+    syncRecordingControl();
+    showRecordingFeedback("recording", "正在录制屏幕 · 点击停止并下载");
+    log("开始录制 AI Passport 屏幕");
+    const blob = await screenRecording.completed;
+    if (!blob) return;
+    if (recordingUrl) URL.revokeObjectURL(recordingUrl);
+    recordingUrl = URL.createObjectURL(blob);
+    recordingDownload.href = recordingUrl;
+    recordingDownload.download = recordingFilename(blob.type);
+    recordingDownload.hidden = false;
+    showRecordingFeedback("success", `录屏已完成 · ${formatFirmwareSize(blob.size)}`);
+    recordingDownload.click();
+    log("屏幕录制完成，可点击“下载视频”保存");
+  } catch (error) {
+    const message = /[\u4e00-\u9fff]/u.test(error?.message || "") ? error.message :
+      "屏幕录制失败，请重试或使用新版浏览器";
+    showRecordingFeedback("error", message);
+    log(message);
+  } finally {
+    window.clearInterval(recordingTimer);
+    screenRecording = null;
+    recordingStopping = false;
+    syncRecordingControl();
+  }
+}
+
 function drawFrame({ pixels, x = 0, y = 0, width, height }) {
   if (x + width > display.width || y + height > display.height) return;
   context.putImageData(
-    new ImageData(new Uint8ClampedArray(pixels), width, height),
+    new ImageData(pixels, width, height),
     x,
     y,
   );
 }
 
-function dispatchButtonEvent(key, event, visible = true) {
-  let delivered = true;
-  if (event === "PRESS") {
-    delivered = key === "POWER" ? runtime.restart() : currentRuntimeState === "running";
-  } else if (event === "LONG" && key !== "POWER") {
-    delivered = runtime.setButton(key, true);
-  } else if (["CLICK", "DOUBLE"].includes(event) && key !== "POWER") {
-    delivered = runtime.sendButtonGesture(key, event);
-  }
-  if (visible) {
-    const labels = {
-      PRESS: "按下",
-      CLICK: "单击",
-      DOUBLE: "双击",
-      LONG: "长按",
-    };
-    log(`${key} ${labels[event] || event}${delivered ? "" : "，等待运行时"}`);
-  }
-}
-
-function queueButtonClick(key) {
-  const pending = pendingButtonClicks.get(key);
-  if (pending !== undefined) {
-    window.clearTimeout(pending);
-    pendingButtonClicks.delete(key);
-    dispatchButtonEvent(key, "DOUBLE");
-    return;
-  }
-  pendingButtonClicks.set(key, window.setTimeout(() => {
-    pendingButtonClicks.delete(key);
-    dispatchButtonEvent(key, "CLICK");
-  }, DOUBLE_CLICK_WINDOW_MS));
-}
-
+// Send physical transitions immediately. The firmware already recognizes clicks,
+// double clicks and holds; delaying a click here added 300 ms to every interaction.
 function startButtonPress(key) {
-  if (key === "POWER") {
-    dispatchButtonEvent(key, "PRESS");
-    return;
-  }
+  if (key === "POWER") { runtime.restart(); log("POWER 按下"); return; }
   if (activeButtonGestures.has(key)) return;
-  const state = { long: false, longTimer: 0 };
-  activeButtonGestures.set(key, state);
-  dispatchButtonEvent(key, "PRESS");
-  state.longTimer = window.setTimeout(() => {
-    if (activeButtonGestures.get(key) !== state) return;
-    state.long = true;
-    dispatchButtonEvent(key, "LONG");
-  }, LONG_PRESS_MS);
+  activeButtonGestures.set(key, true);
+  runtime.setButton(key, true);
+  log(`${key} 按下`);
 }
 
-function finishButtonPress(key, cancelled = false) {
-  const state = activeButtonGestures.get(key);
-  if (!state) return;
-  window.clearTimeout(state.longTimer);
-  if (state.long) runtime.setButton(key, false);
-  activeButtonGestures.delete(key);
-  if (!cancelled && !state.long) queueButtonClick(key);
+function finishButtonPress(key) {
+  if (!activeButtonGestures.delete(key)) return;
+  runtime.setButton(key, false);
 }
 
 function resetButtonGestures() {
-  for (const [key, state] of activeButtonGestures) {
-    window.clearTimeout(state.longTimer);
-    if (state.long) runtime.setButton(key, false);
-  }
+  runtime.releaseButtons();
   activeButtonGestures.clear();
-  for (const timer of pendingButtonClicks.values()) window.clearTimeout(timer);
-  pendingButtonClicks.clear();
   heldPointerButtons.clear();
   heldKeyboardButtons.clear();
 }
@@ -646,6 +686,60 @@ runtime.addEventListener("progress", (event) => {
 runtime.addEventListener("frame", (event) => drawFrame(event.detail));
 runtime.addEventListener("audio-config", (event) => audio.configure(event.detail));
 runtime.addEventListener("audio", (event) => audio.play(event.detail));
+runtime.addEventListener("microphone-status", ({ detail }) => {
+  const message = `麦克风：采集 ${detail.capturedFrames} 样本 · 写入固件缓冲区 ${detail.deliveredBytes} 字节 · ` +
+    `${detail.sampleRate} Hz / ${detail.channels} 声道 · 电平 ${(detail.level * 100).toFixed(2)}%`;
+  document.querySelector('#microphone-status').textContent = message;
+  microphoneToggle.title = message;
+});
+const virtualWifiButton = document.querySelector('#virtual-wifi-connect');
+let provisionableFirmware = null;
+const firmwareOperations = new FirmwareOperationGate();
+
+function syncVirtualWifiControl() {
+  virtualWifiButton.hidden = !provisionableFirmware;
+  virtualWifiButton.disabled = !provisionableFirmware || currentRuntimeState !== "running";
+}
+
+function beginFirmwareOperation() {
+  const operation = firmwareOperations.begin();
+  provisionableFirmware = null;
+  syncVirtualWifiControl();
+  setUploadBusy(true);
+  return operation;
+}
+
+runtime.addEventListener('firmware', async ({ detail }) => {
+  const operation = firmwareOperations.current();
+  provisionableFirmware = null;
+  syncVirtualWifiControl();
+  try {
+    if (await supportsVirtualProvisioning(detail.bytes) && firmwareOperations.isCurrent(operation)) {
+      provisionableFirmware = detail.bytes;
+      syncVirtualWifiControl();
+    }
+  } catch (error) { log(`配网适配检查失败：${error.message}`); }
+});
+virtualWifiButton.addEventListener('click', async () => {
+  const firmware = provisionableFirmware;
+  if (!firmware) return;
+  const operation = beginFirmwareOperation();
+  try {
+    const response = await fetch('/assets/provisioning/xiaozhi-wifi.nvs');
+    if (!response.ok) throw new Error('读取模拟配网配置失败');
+    const configured = await provisionXiaozhi(firmware, new Uint8Array(await response.arrayBuffer()));
+    if (!firmwareOperations.isCurrent(operation)) return;
+    log('已为小智写入模拟 Wi-Fi 配置，正在重启。此操作只修改本次模拟的虚拟 Flash。');
+    await runtime.loadFirmware(configured);
+  } catch (error) {
+    log(`模拟配网失败：${error.message}`);
+    if (firmwareOperations.isCurrent(operation)) {
+      provisionableFirmware = firmware;
+      setUploadBusy(false);
+      syncVirtualWifiControl();
+    }
+  }
+});
 runtime.addEventListener("firmware", () => {
   clearUartConsole();
   resetNetworkView();
@@ -761,11 +855,25 @@ audio.addEventListener("microphone", (event) => {
   microphoneToggle.textContent = event.detail ? "MIC 已授权" : "授权 MIC";
   log(event.detail ? "麦克风输入已启用" : "麦克风输入已关闭");
 });
+audio.addEventListener("status", ({ detail }) => {
+  document.querySelector("#audio-status").textContent =
+    `声音缓冲 ${Math.round(detail.bufferedMs)} ms · 缓冲中断 ${detail.underruns} 次 · ` +
+    `采样 ${detail.inputRate} Hz · 已接收 ${detail.inputFrames} / 已播放 ${detail.outputFrames}`;
+});
 inspectorToggle.addEventListener("click", () => {
   setInspectorOpen(!inspectorPanel.classList.contains("is-open"));
 });
 document.querySelector("#inspector-close").addEventListener("click", () => setInspectorOpen(false));
 screenshotCopy.addEventListener("click", copySimulatorScreen);
+recordingToggle.addEventListener("click", toggleScreenRecording);
+window.addEventListener("pagehide", () => {
+  screenRecording?.cancel();
+  window.clearInterval(recordingTimer);
+  if (recordingUrl) URL.revokeObjectURL(recordingUrl);
+  recordingUrl = null;
+  recordingDownload.hidden = true;
+  recordingFeedback.hidden = true;
+});
 fullscreenToggle.addEventListener("click", toggleSimulatorFullscreen);
 document.addEventListener("fullscreenchange", () => {
   if (document.fullscreenElement !== simulatorStage) fullscreenFallback = false;
@@ -836,6 +944,7 @@ async function configureFirmwareSources() {
 }
 
 async function loadPresetFirmware(button) {
+  const operation = beginFirmwareOperation();
   const firmwareName = button.dataset.firmwareName;
   const firmwareUrl = button.dataset.firmwareUrl;
   const previousFirmwareName = activeFirmwareName;
@@ -856,11 +965,13 @@ async function loadPresetFirmware(button) {
     const response = await fetch(firmwareUrl, { cache: "no-store" });
     if (!response.ok) throw new Error(`镜像请求失败: ${response.status}`);
     const firmware = await readFirmwareResponse(response, firmwareName);
+    if (!firmwareOperations.isCurrent(operation)) return;
     setLoadingProgress(62, "正在校验固件", formatFirmwareSize(firmware.byteLength));
     validateFirmwareFile({ name: firmwareUrl, size: firmware.byteLength });
     log(`加载 ${firmwareName} (${formatFirmwareSize(firmware.byteLength)})`);
     await runtime.loadFirmware(firmware);
   } catch (error) {
+    if (!firmwareOperations.isCurrent(operation)) return;
     pendingPresetId = previousPendingPresetId;
     activeFirmwareName = previousFirmwareName;
     setUploadBusy(false);
@@ -888,6 +999,7 @@ uploadControl.addEventListener("click", () => {
 
 async function importCommunityFirmware() {
   if (!communityPlayUrl.reportValidity()) return;
+  const operation = beginFirmwareOperation();
   const previousFirmwareName = activeFirmwareName;
   const previousRuntimeState = currentRuntimeState;
   const previousRuntimeDetail = runtimeState.textContent;
@@ -914,6 +1026,7 @@ async function importCommunityFirmware() {
     }
 
     const firmware = await readFirmwareResponse(response, "社区固件");
+    if (!firmwareOperations.isCurrent(operation)) return;
     let firmwareName = response.headers.get("x-firmware-name") || "社区固件";
     try {
       firmwareName = decodeURIComponent(firmwareName);
@@ -927,6 +1040,7 @@ async function importCommunityFirmware() {
     log(`导入 ${firmwareName} (${formatFirmwareSize(firmware.byteLength)})`);
     await runtime.loadFirmware(firmware);
   } catch (error) {
+    if (!firmwareOperations.isCurrent(operation)) return;
     pendingPresetId = previousPendingPresetId;
     activeFirmwareName = previousFirmwareName;
     setUploadBusy(false);
@@ -964,6 +1078,7 @@ firmwareInput.addEventListener("change", async () => {
   if (!allowLocalFirmwareUpload) return;
   if (!file) return;
 
+  const operation = beginFirmwareOperation();
   const previousFirmwareName = activeFirmwareName;
   const previousRuntimeState = currentRuntimeState;
   const previousRuntimeDetail = runtimeState.textContent;
@@ -978,8 +1093,11 @@ firmwareInput.addEventListener("change", async () => {
     presetFeedback.textContent = `正在加载本地固件 ${file.name}`;
     renderPresetStates();
     log(`加载 ${file.name} (${formatFirmwareSize(file.size)})`);
-    await runtime.loadFirmware(await readLocalFirmware(file));
+    const firmware = await readLocalFirmware(file);
+    if (!firmwareOperations.isCurrent(operation)) return;
+    await runtime.loadFirmware(firmware);
   } catch (error) {
+    if (!firmwareOperations.isCurrent(operation)) return;
     pendingPresetId = undefined;
     activeFirmwareName = previousFirmwareName;
     setUploadBusy(false);
@@ -1053,7 +1171,9 @@ async function startApplication() {
     return;
   }
 
+  const operation = beginFirmwareOperation();
   runtime.start(initialPresetButton.dataset.firmwareUrl).catch((error) => {
+    if (!firmwareOperations.isCurrent(operation)) return;
     setUploadBusy(false);
     setRuntimeState("waiting", "等待 WASM QEMU");
     overlay.classList.add("is-error");
