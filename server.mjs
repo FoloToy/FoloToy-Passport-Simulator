@@ -250,6 +250,7 @@ async function serve(request, response, {
   if (requestUrl.pathname === "/api/community-firmware") {
     await serveCommunityFirmware(request, response, {
       communityFirmwareFetcher,
+      firmwareCache,
       logger,
       requestId,
     });
