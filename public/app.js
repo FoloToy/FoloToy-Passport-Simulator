@@ -698,7 +698,10 @@ const firmwareOperations = new FirmwareOperationGate();
 
 function syncVirtualWifiControl() {
   virtualWifiButton.hidden = !provisionableFirmware;
-  virtualWifiButton.disabled = !provisionableFirmware || currentRuntimeState !== "running";
+  // Unprovisioned XiaoZhi falls back to BLE provisioning and pauses as
+  // "unsupported"; that is exactly when virtual Wi-Fi must stay usable.
+  virtualWifiButton.disabled = !provisionableFirmware ||
+    !["running", "unsupported"].includes(currentRuntimeState);
 }
 
 function beginFirmwareOperation() {
@@ -779,7 +782,9 @@ runtime.addEventListener("unsupported-feature", (event) => {
   setRuntimeState("unsupported", "检测到 BLE，模拟器已暂停");
   overlay.classList.add("is-unsupported");
   overlay.querySelector("strong").textContent = "模拟器暂不支持蓝牙";
-  loadingDetail.textContent = "This Emulator Does Not Support BLE";
+  loadingDetail.textContent = provisionableFirmware
+    ? "固件正在等待蓝牙配网。点击顶部“连接模拟 Wi-Fi”可跳过蓝牙直接联网"
+    : "This Emulator Does Not Support BLE";
   presetFeedback.textContent = `${activeFirmwareName} 需要 BLE，已停止运行`;
   log(`${activeFirmwareName} 使用了暂不支持的 BLE`);
 });
