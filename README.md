@@ -76,6 +76,11 @@ http://127.0.0.1:4190/?id=2
 可重复性能检查：`node tools/benchmark-simulator.mjs`；网络固定延迟确认对照：
 `node tools/benchmark-network.mjs --baseline` 与 `node tools/benchmark-network.mjs`。
 
+联网端到端检查：`npm run verify:network`。它在 Node 中运行
+`tools/network-test-firmware/network-test.bin`，经网络桥依次验证 Wi-Fi 关联、DHCP、
+DNS、TCP 连接和 `example.com` 的 HTTP 200，需要本机能访问外网。若本机代理使用
+fake-IP 模式（DNS 返回 `198.18.x.x`），请改用 `npm run verify:network -- --allow-private`。
+
 ## 必要依赖
 
 - Node.js 20 或更高版本
