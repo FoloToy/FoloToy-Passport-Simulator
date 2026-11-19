@@ -745,3 +745,49 @@ test("forwards gateway DNS packets and restores the emulated source address", ()
   assert.deepEqual(responseUdp.payload, new Uint8Array(answer));
   session.close();
 });
+
+test("answers DNS sent to a public resolver through the host resolver", () => {
+  // The emulator's DHCP hands out 8.8.8.8, which is unreachable on many networks.
+  class FakeUdpSocket extends EventEmitter {
+    sent = [];
+    send(payload, port, address) {
+      this.sent.push({ payload: Buffer.from(payload), port, address });
+    }
+    close() {}
+  }
+
+  const socket = new FakeUdpSocket();
+  const sent = [];
+  const session = new EthernetNatSession({
+    sendFrame: (frame) => sent.push(frame),
+    createUdpSocket: () => socket,
+    dnsServer: "192.0.2.53",
+  });
+  const publicResolver = Uint8Array.of(8, 8, 8, 8);
+  const query = Uint8Array.of(0xab, 0xcd, 0x01, 0x00);
+  session.receive(buildIpv4Frame({
+    sourceMac: GUEST_MAC,
+    destinationMac: GATEWAY_MAC,
+    sourceIp: GUEST_IP,
+    destinationIp: publicResolver,
+    protocol: IP_PROTOCOL_UDP,
+    payload: buildUdpPacket({
+      sourceIp: GUEST_IP,
+      destinationIp: publicResolver,
+      sourcePort: 13132,
+      destinationPort: 53,
+      payload: query,
+    }),
+  }));
+  assert.deepEqual(socket.sent[0], {
+    payload: Buffer.from(query),
+    port: 53,
+    address: "192.0.2.53",
+  });
+
+  socket.emit("message", Buffer.from([0xab, 0xcd, 0x81, 0x80]));
+  const responseIp = parseIpv4Frame(sent[0]);
+  assert.deepEqual(responseIp.sourceIp, publicResolver);
+  assert.equal(parseUdpPacket(responseIp.payload).destinationPort, 13132);
+  session.close();
+});

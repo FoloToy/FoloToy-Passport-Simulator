@@ -529,9 +529,11 @@ export class EthernetNatSession {
   #receiveUdp(ipv4) {
     const udp = parseUdpPacket(ipv4.payload);
     if (!udp) return;
-    const isGatewayDns =
-      udp.destinationPort === 53 && sameIp(ipv4.destinationIp, GATEWAY_IP);
-    if (!isGatewayDns && !this.#targetAllowed(ipv4.destinationIp)) {
+    // The emulator's DHCP hands out a public resolver (8.8.8.8), which many
+    // deployment networks cannot reach. Answer every guest DNS query through
+    // the host resolver; replies keep the server address the guest asked.
+    const isDns = udp.destinationPort === 53;
+    if (!isDns && !this.#targetAllowed(ipv4.destinationIp)) {
       this.emitEvent({
         event: "connection-blocked",
         protocol: "UDP",
@@ -552,7 +554,7 @@ export class EthernetNatSession {
         guestPort: udp.sourcePort,
         wireRemoteIp: ipv4.destinationIp,
         wireRemotePort: udp.destinationPort,
-        targetAddress: isGatewayDns ? this.dnsServer : ipToString(ipv4.destinationIp),
+        targetAddress: isDns ? this.dnsServer : ipToString(ipv4.destinationIp),
         targetPort: udp.destinationPort,
         timer: null,
       };
@@ -569,7 +571,7 @@ export class EthernetNatSession {
       this.udpFlows.set(key, flow);
       this.emitEvent({
         event: "connection-open",
-        protocol: isGatewayDns ? "DNS" : "UDP",
+        protocol: isDns ? "DNS" : "UDP",
         target: `${flow.targetAddress}:${flow.targetPort}`,
       });
     }

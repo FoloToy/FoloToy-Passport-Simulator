@@ -10,6 +10,7 @@
     "start": "node server.mjs --allow-local-firmware-upload",
     "start:dist": "node dist/server.mjs",
     "verify:release": "node tools/verify-site.mjs",
+    "verify:network": "node tools/verify-network.mjs",
     "test": "node --test"
   },
   "engines": {
